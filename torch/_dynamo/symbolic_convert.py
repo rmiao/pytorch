@@ -24,6 +24,8 @@ optimization of PyTorch programs.
 
 from __future__ import annotations
 
+import _warnings
+
 import collections
 import collections.abc
 import contextlib
@@ -804,7 +806,12 @@ def generic_jump(
             self.output.add_output_instructions([create_instruction("TO_BOOL")])
 
         jump_inst = create_instruction(inst.opname, target=if_jump[0])
-        jump_inst.copy_positions(inst)
+        # For inlined frames, use the root frame's current instruction
+        # positions so the output code maps to the correct source line.
+        positions_inst = (
+            self.output.root_tx.current_instruction if self.parent is not None else inst
+        )
+        jump_inst.copy_positions(positions_inst)
         self.output.add_output_instructions([jump_inst] + if_next + if_jump)
 
     def inner(self: InstructionTranslatorBase, inst: Instruction) -> None:
@@ -1004,6 +1011,27 @@ def _reconstruct_block_stack(
             cg.extend_output(b.resume_fn().try_finally(cg.code_options, cleanup))
 
 
+def _make_warnings_warn_wrapper(filename: str, lineno: int) -> Callable[..., Any]:
+    """Create a wrapper for warnings.warn that reports the given source location.
+
+    When warnings.warn (stacklevel=1) inspects its caller frame, it sees the
+    wrapper's code object -- whose co_filename and line table point to the
+    original leaf-frame location.  This preserves Python's per-location
+    warning dedup even when the call is inlined into a different frame by
+    nested graph breaks.
+    """
+    import warnings
+
+    # Use a lambda so all bytecode is on one line and co_firstlineno
+    # equals the body line (no off-by-one vs a multi-line def).
+    wrapper: Callable[..., Any] = lambda *args, **kwargs: warnings.warn(*args, **kwargs)  # noqa: E731
+    wrapper.__code__ = wrapper.__code__.replace(
+        co_filename=filename,
+        co_firstlineno=lineno,
+    )
+    return wrapper
+
+
 # NOTE: for the purposes of nested graph breaks, break_graph_if_unsupported only works on instructions
 # with 0 or 1 outputs. If you wish to support bytecodes with 2+ outputs, either rewrite the instruction
 # into a sequence of simpler instructions, or file an issue for consultation.
@@ -1105,6 +1133,26 @@ def break_graph_if_unsupported(
             self.output.add_output_instructions(cg.get_instructions())
             del cg
 
+            # For inlined frames, use the root frame's current instruction
+            # positions so the output code maps to the correct source line.
+            # The output code is always for the root function, so line numbers
+            # from inlined child frames would be wrong.
+            positions_inst = (
+                self.output.root_tx.current_instruction
+                if self.parent is not None
+                else inst
+            )
+
+            # When warnings.warn is called from an inlined frame, wrap it so
+            # that Python's per-location dedup sees the leaf frame's filename
+            # and line number instead of the root frame's.
+            if (
+                self.parent is not None
+                and inst.opname == "CALL"
+                and inst.arg is not None
+            ):
+                self._maybe_swap_warnings_warn_wrapper(inst)
+
             if sys.version_info >= (3, 11) and inst.opname == "CALL":
                 kw_names = (
                     self.kw_names.as_python_constant()
@@ -1123,7 +1171,7 @@ def break_graph_if_unsupported(
                 if inst.arg is None:
                     raise AssertionError("expected inst.arg is not None to be true")
                 call_insts = create_call_function(inst.arg, False)
-                call_insts[-1].copy_positions(inst)
+                call_insts[-1].copy_positions(positions_inst)
                 self.output.add_output_instructions(call_insts)
             else:
                 # copy instruction, but without exception table data
@@ -1131,6 +1179,7 @@ def break_graph_if_unsupported(
                     raise AssertionError("expected inst.target is None to be true")
                 inst_copy = copy.copy(inst)
                 inst_copy.exn_tab_entry = None
+                inst_copy.copy_positions(positions_inst)
                 self.output.add_output_instructions([inst_copy])
 
             self.output.add_output_instructions(cleanup)
@@ -3328,6 +3377,58 @@ class InstructionTranslatorBase(
         counters["resumes"][new_code.co_name] += 1
 
         return new_code, resume_name
+
+    def _maybe_swap_warnings_warn_wrapper(self, inst: Instruction) -> None:
+        """Swap warnings.warn on the bytecode stack with a wrapper that
+        preserves the leaf frame's source location for warning dedup.
+
+        When nested graph breaks inline a warnings.warn call into the root
+        frame's bytecode, the root frame's line numbers defeat Python's
+        per-location warning dedup.  This emits bytecode to replace the
+        callable on the stack with a thin wrapper whose code object reports
+        the original (leaf frame) filename and line number.
+        """
+        if inst.arg is None:
+            return
+
+        # Find the callable on the symbolic stack (mirrors _call logic)
+        stack_items = self.stack[-(inst.arg + 2) :]
+        if sys.version_info >= (3, 13):
+            callable_var = stack_items[0]
+        elif isinstance(stack_items[0], NullVariable):
+            callable_var = stack_items[1]
+        else:
+            callable_var = stack_items[0]
+
+        if not (
+            isinstance(callable_var, SkipFunctionVariable)
+            and callable_var.value is _warnings.warn
+        ):
+            return
+
+        leaf_filename = self.f_code.co_filename
+        leaf_lineno = inst.positions.lineno if inst.positions else None
+        if leaf_lineno is None:
+            return
+
+        wrapper = _make_warnings_warn_wrapper(leaf_filename, leaf_lineno)
+        wrapper_name = self.output.install_global("__warnings_warn_wrapper", wrapper)
+
+        # The bytecode stack (after compile_subgraph) has:
+        #   ... | NULL/self | callable | arg0 | ... | argN-1
+        # callable position from TOS (1-indexed):
+        #   3.11/3.12: inst.arg + 1  (NULL below callable)
+        #   3.13+:     inst.arg + 2  (callable below NULL)
+        # After LOAD_GLOBAL pushes one item, positions shift by +1.
+        if sys.version_info >= (3, 13):
+            swap_pos = inst.arg + 3
+        else:
+            swap_pos = inst.arg + 2
+
+        load_wrapper = create_instruction("LOAD_GLOBAL", argval=wrapper_name)
+        swap = create_instruction("SWAP", arg=swap_pos)
+        pop = create_instruction("POP_TOP")
+        self.output.add_output_instructions([load_wrapper, swap, pop])
 
     def create_call_resume_at(
         self,
